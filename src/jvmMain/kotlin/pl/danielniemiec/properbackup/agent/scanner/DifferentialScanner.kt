@@ -13,7 +13,7 @@ import java.nio.file.attribute.BasicFileAttributes
 import java.util.concurrent.atomic.AtomicInteger
 
 fun interface ScanProgressListener {
-    fun onProgress(scannedFiles: Int, currentFile: String)
+    fun onProgress(scannedFiles: Int, currentFile: String, recentFiles: List<String>)
 }
 
 class DifferentialScanner(excludeGlobs: List<String>?) {
@@ -47,6 +47,7 @@ class DifferentialScanner(excludeGlobs: List<String>?) {
         val current = HashMap<String, FileMetadata>()
         val changed = ArrayList<Path>()
         val counter = AtomicInteger(0)
+        val recentBatch = ArrayList<String>()
 
         try {
             Files.walkFileTree(rootDir, object : SimpleFileVisitor<Path>() {
@@ -80,9 +81,11 @@ class DifferentialScanner(excludeGlobs: List<String>?) {
                     val changedFile = prev == null || prev.xxHash != hash
                     if (changedFile) changed.add(file)
 
+                    recentBatch.add(file.toString())
                     val count = counter.incrementAndGet()
                     if (progressListener != null && count % 50 == 0) {
-                        progressListener.onProgress(count, rel)
+                        progressListener.onProgress(count, rel, ArrayList(recentBatch))
+                        recentBatch.clear()
                     }
                     return FileVisitResult.CONTINUE
                 }
@@ -99,7 +102,7 @@ class DifferentialScanner(excludeGlobs: List<String>?) {
             )
         }
 
-        progressListener?.onProgress(current.size, "")
+        progressListener?.onProgress(current.size, "", ArrayList(recentBatch))
 
         val deleted = previousState.keys.filter { !current.containsKey(it) }
 

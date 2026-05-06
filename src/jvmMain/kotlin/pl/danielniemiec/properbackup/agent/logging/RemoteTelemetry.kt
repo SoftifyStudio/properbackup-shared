@@ -42,6 +42,18 @@ class RemoteTelemetry(private val global: GlobalConfig, private val machineId: S
         post("$base/agent/file-state", body)
     }
 
+    fun fileStateBatch(fullPaths: List<String>, status: String) {
+        if (!enabled || fullPaths.isEmpty()) return
+        val files = fullPaths.map { mapOf("fullPath" to it, "status" to status) }
+        val body = gson.toJson(
+            mapOf(
+                "machineId" to machineId,
+                "files" to files,
+            ),
+        )
+        post("$base/agent/file-states", body)
+    }
+
     /** Stan dla panelu (Spotlight-style): phase ∈ indexing | uploading | idle | waiting | error */
     fun agentStatus(phase: String, detail: String? = null) {
         agentStatus(phase, detail, null, null, null)
