@@ -10,6 +10,12 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.SimpleFileVisitor
 import java.nio.file.attribute.BasicFileAttributes
+import java.util.concurrent.atomic.AtomicInteger
+
+fun interface ScanProgressListener {
+    fun onProgress(scannedFiles: Int, currentFile: String)
+}
+
 class DifferentialScanner(excludeGlobs: List<String>?) {
 
     data class ScanResult(
@@ -28,6 +34,11 @@ class DifferentialScanner(excludeGlobs: List<String>?) {
 
     @Throws(IOException::class)
     fun scan(rootDir: Path, previousState: Map<String, FileMetadata>): ScanResult {
+        return scan(rootDir, previousState, null)
+    }
+
+    @Throws(IOException::class)
+    fun scan(rootDir: Path, previousState: Map<String, FileMetadata>, progressListener: ScanProgressListener?): ScanResult {
         if (!Files.exists(rootDir)) {
             val deleted = ArrayList(previousState.keys)
             return ScanResult(emptyList(), deleted, emptyMap())
@@ -35,6 +46,7 @@ class DifferentialScanner(excludeGlobs: List<String>?) {
 
         val current = HashMap<String, FileMetadata>()
         val changed = ArrayList<Path>()
+        val counter = AtomicInteger(0)
 
         try {
             Files.walkFileTree(rootDir, object : SimpleFileVisitor<Path>() {
@@ -67,6 +79,11 @@ class DifferentialScanner(excludeGlobs: List<String>?) {
 
                     val changedFile = prev == null || prev.xxHash != hash
                     if (changedFile) changed.add(file)
+
+                    val count = counter.incrementAndGet()
+                    if (progressListener != null && count % 50 == 0) {
+                        progressListener.onProgress(count, rel)
+                    }
                     return FileVisitResult.CONTINUE
                 }
 
@@ -81,6 +98,8 @@ class DifferentialScanner(excludeGlobs: List<String>?) {
                 e,
             )
         }
+
+        progressListener?.onProgress(current.size, "")
 
         val deleted = previousState.keys.filter { !current.containsKey(it) }
 
