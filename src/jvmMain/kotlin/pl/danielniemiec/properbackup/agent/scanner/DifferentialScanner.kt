@@ -10,6 +10,10 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.SimpleFileVisitor
 import java.nio.file.attribute.BasicFileAttributes
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ForkJoinPool
+import java.util.concurrent.atomic.AtomicReference
+
 class DifferentialScanner(excludeGlobs: List<String>?) {
 
     data class ScanResult(
@@ -33,40 +37,16 @@ class DifferentialScanner(excludeGlobs: List<String>?) {
             return ScanResult(emptyList(), deleted, emptyMap())
         }
 
-        val current = HashMap<String, FileMetadata>()
-        val changed = ArrayList<Path>()
-
+        val entries = ArrayList<FileEntry>()
         try {
             Files.walkFileTree(rootDir, object : SimpleFileVisitor<Path>() {
                 override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
                     val rel = rootDir.relativize(file).toString()
                     val relNormalized = Path.of(rel.replace('\\', '/'))
-
                     if (excludeFilter.shouldExclude(relNormalized)) {
                         return FileVisitResult.CONTINUE
                     }
-
-                    val size = attrs.size()
-                    val mtime = attrs.lastModifiedTime().toMillis()
-                    val prev = previousState[rel]
-
-                    val needsHash = prev == null || prev.size != size || prev.lastModified != mtime
-                    val hash: Long = if (needsHash) {
-                        try {
-                            val bytes = Files.readAllBytes(file)
-                            LongHashFunction.xx3().hashBytes(bytes)
-                        } catch (e: IOException) {
-                            -1L
-                        }
-                    } else {
-                        prev!!.xxHash
-                    }
-
-                    val meta = FileMetadata(rel, size, mtime, hash)
-                    current[rel] = meta
-
-                    val changedFile = prev == null || prev.xxHash != hash
-                    if (changedFile) changed.add(file)
+                    entries.add(FileEntry(file, rel, attrs.size(), attrs.lastModifiedTime().toMillis()))
                     return FileVisitResult.CONTINUE
                 }
 
@@ -82,8 +62,63 @@ class DifferentialScanner(excludeGlobs: List<String>?) {
             )
         }
 
-        val deleted = previousState.keys.filter { !current.containsKey(it) }
+        val current = ConcurrentHashMap<String, FileMetadata>(entries.size)
+        val changed = ConcurrentHashMap.newKeySet<Path>()
+        val firstError = AtomicReference<Throwable?>()
 
-        return ScanResult(changed, deleted, current)
+        val cores = Runtime.getRuntime().availableProcessors()
+        val parallelism = maxOf(1, cores - 1)
+
+        if (entries.size < 200 || parallelism <= 1) {
+            for (e in entries) {
+                processEntry(e, previousState, current, changed)
+            }
+        } else {
+            val pool = ForkJoinPool(parallelism)
+            try {
+                pool.submit {
+                    entries.parallelStream().forEach { e ->
+                        try {
+                            processEntry(e, previousState, current, changed)
+                        } catch (t: Throwable) {
+                            firstError.compareAndSet(null, t)
+                        }
+                    }
+                }.get()
+            } finally {
+                pool.shutdown()
+            }
+            firstError.get()?.let { throw IOException("Parallel scan error", it) }
+        }
+
+        val deleted = previousState.keys.filter { !current.containsKey(it) }
+        return ScanResult(ArrayList(changed), deleted, HashMap(current))
     }
+
+    private fun processEntry(
+        entry: FileEntry,
+        previousState: Map<String, FileMetadata>,
+        current: ConcurrentHashMap<String, FileMetadata>,
+        changed: MutableSet<Path>,
+    ) {
+        val prev = previousState[entry.rel]
+        val needsHash = prev == null || prev.size != entry.size || prev.lastModified != entry.mtime
+        val hash: Long = if (needsHash) {
+            try {
+                val bytes = Files.readAllBytes(entry.file)
+                LongHashFunction.xx3().hashBytes(bytes)
+            } catch (e: IOException) {
+                -1L
+            }
+        } else {
+            prev!!.xxHash
+        }
+        val meta = FileMetadata(entry.rel, entry.size, entry.mtime, hash)
+        current[entry.rel] = meta
+        if (prev == null || prev.xxHash != hash) {
+            changed.add(entry.file)
+        }
+    }
+
+    private data class FileEntry(val file: Path, val rel: String, val size: Long, val mtime: Long)
 }

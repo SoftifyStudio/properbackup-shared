@@ -38,6 +38,31 @@ class BufferUploader(
         postAgentJson("$bufferUrl/agent/register-paths", body)
     }
 
+    /** Notify buffer that a scan cycle completed — triggers immediate flush. */
+    fun notifyScanComplete(serverId: String?) {
+        val b = HttpRequest.newBuilder()
+            .uri(URI.create("$bufferUrl/agent/scan-complete"))
+            .timeout(Duration.ofSeconds(15))
+            .header("Authorization", "Bearer $token")
+            .POST(HttpRequest.BodyPublishers.noBody())
+        if (!serverId.isNullOrBlank()) b.header("X-Server-Id", serverId)
+        runCatching { http.send(b.build(), HttpResponse.BodyHandlers.discarding()) }
+    }
+
+    /** Report agent CPU/RAM metrics to buffer for monitoring dashboard. */
+    fun reportMetrics(serverId: String, cpuPercent: Float, ramUsedMb: Float, ramTotalMb: Float) {
+        if (serverId.isBlank()) return
+        val body = gson.toJson(
+            mapOf(
+                "serverId" to serverId,
+                "cpuPercent" to cpuPercent,
+                "ramUsedMb" to ramUsedMb,
+                "ramTotalMb" to ramTotalMb,
+            ),
+        )
+        postAgentJson("$bufferUrl/agent/metrics", body)
+    }
+
     /** Lista skonfigurowanych rootów — widoczność w panelu od pierwszego cyklu. */
     fun postBackupRoots(machineId: String, roots: List<Pair<String, String>>) {
         if (machineId.isBlank() || roots.isEmpty()) return
