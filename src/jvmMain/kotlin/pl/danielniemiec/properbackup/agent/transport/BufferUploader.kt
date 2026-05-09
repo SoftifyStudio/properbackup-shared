@@ -57,11 +57,13 @@ class BufferUploader(
         ramTotalMb: Float,
         perCoreCpu: List<Float>? = null,
         coreCount: Int = Runtime.getRuntime().availableProcessors(),
+        agentCpuPercent: Float = 0f,
     ) {
         if (serverId.isBlank()) return
         val payload = linkedMapOf<String, Any>(
             "serverId" to serverId,
             "cpuPercent" to cpuPercent,
+            "agentCpuPercent" to agentCpuPercent,
             "ramUsedMb" to ramUsedMb,
             "ramTotalMb" to ramTotalMb,
             "coreCount" to coreCount,
