@@ -10,9 +10,6 @@ import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.SimpleFileVisitor
 import java.nio.file.attribute.BasicFileAttributes
-import java.util.concurrent.ConcurrentHashMap
-import java.util.concurrent.ForkJoinPool
-import java.util.concurrent.atomic.AtomicReference
 
 class DifferentialScanner(excludeGlobs: List<String>?) {
 
@@ -62,51 +59,32 @@ class DifferentialScanner(excludeGlobs: List<String>?) {
             )
         }
 
-        val current = ConcurrentHashMap<String, FileMetadata>(entries.size)
-        val changed = ConcurrentHashMap.newKeySet<Path>()
-        val firstError = AtomicReference<Throwable?>()
+        val current = HashMap<String, FileMetadata>(entries.size)
+        val changed = ArrayList<Path>()
 
-        val cores = Runtime.getRuntime().availableProcessors()
-        val parallelism = maxOf(1, cores - 1)
-
-        if (entries.size < 200 || parallelism <= 1) {
-            for (e in entries) {
-                processEntry(e, previousState, current, changed)
+        for ((idx, e) in entries.withIndex()) {
+            processEntry(e, previousState, current, changed)
+            if (idx % 50 == 49) {
+                Thread.yield()
+                Thread.sleep(1)
             }
-        } else {
-            val pool = ForkJoinPool(parallelism)
-            try {
-                pool.submit {
-                    entries.parallelStream().forEach { e ->
-                        try {
-                            processEntry(e, previousState, current, changed)
-                        } catch (t: Throwable) {
-                            firstError.compareAndSet(null, t)
-                        }
-                    }
-                }.get()
-            } finally {
-                pool.shutdown()
-            }
-            firstError.get()?.let { throw IOException("Parallel scan error", it) }
         }
 
         val deleted = previousState.keys.filter { !current.containsKey(it) }
-        return ScanResult(ArrayList(changed), deleted, HashMap(current))
+        return ScanResult(changed, deleted, current)
     }
 
     private fun processEntry(
         entry: FileEntry,
         previousState: Map<String, FileMetadata>,
-        current: ConcurrentHashMap<String, FileMetadata>,
-        changed: MutableSet<Path>,
+        current: MutableMap<String, FileMetadata>,
+        changed: MutableList<Path>,
     ) {
         val prev = previousState[entry.rel]
         val needsHash = prev == null || prev.size != entry.size || prev.lastModified != entry.mtime
         val hash: Long = if (needsHash) {
             try {
-                val bytes = Files.readAllBytes(entry.file)
-                LongHashFunction.xx3().hashBytes(bytes)
+                hashFileStreaming(entry.file)
             } catch (e: IOException) {
                 -1L
             }
@@ -118,6 +96,37 @@ class DifferentialScanner(excludeGlobs: List<String>?) {
         if (prev == null || prev.xxHash != hash) {
             changed.add(entry.file)
         }
+    }
+
+    private fun hashFileStreaming(file: Path): Long {
+        val size = Files.size(file)
+        if (size <= STREAM_THRESHOLD) {
+            return LongHashFunction.xx3().hashBytes(Files.readAllBytes(file))
+        }
+        Files.newInputStream(file).buffered(HASH_BUFFER_SIZE).use { input ->
+            val buf = ByteArray(HASH_BUFFER_SIZE)
+            val hasher = LongHashFunction.xx3()
+            val chunks = ArrayList<ByteArray>()
+            var totalRead = 0L
+            while (true) {
+                val n = input.read(buf)
+                if (n <= 0) break
+                chunks.add(buf.copyOf(n))
+                totalRead += n
+                if (totalRead % (4L * 1024 * 1024) == 0L) {
+                    Thread.yield()
+                }
+            }
+            val full = ByteArray(totalRead.toInt())
+            var off = 0
+            for (c in chunks) { System.arraycopy(c, 0, full, off, c.size); off += c.size }
+            return hasher.hashBytes(full)
+        }
+    }
+
+    companion object {
+        private const val HASH_BUFFER_SIZE = 64 * 1024
+        private const val STREAM_THRESHOLD = 256 * 1024L
     }
 
     private data class FileEntry(val file: Path, val rel: String, val size: Long, val mtime: Long)
