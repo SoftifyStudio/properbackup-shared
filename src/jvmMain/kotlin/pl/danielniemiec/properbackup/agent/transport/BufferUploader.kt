@@ -50,17 +50,26 @@ class BufferUploader(
     }
 
     /** Report agent CPU/RAM metrics to buffer for monitoring dashboard. */
-    fun reportMetrics(serverId: String, cpuPercent: Float, ramUsedMb: Float, ramTotalMb: Float) {
+    fun reportMetrics(
+        serverId: String,
+        cpuPercent: Float,
+        ramUsedMb: Float,
+        ramTotalMb: Float,
+        perCoreCpu: List<Float>? = null,
+        coreCount: Int = Runtime.getRuntime().availableProcessors(),
+    ) {
         if (serverId.isBlank()) return
-        val body = gson.toJson(
-            mapOf(
-                "serverId" to serverId,
-                "cpuPercent" to cpuPercent,
-                "ramUsedMb" to ramUsedMb,
-                "ramTotalMb" to ramTotalMb,
-            ),
+        val payload = linkedMapOf<String, Any>(
+            "serverId" to serverId,
+            "cpuPercent" to cpuPercent,
+            "ramUsedMb" to ramUsedMb,
+            "ramTotalMb" to ramTotalMb,
+            "coreCount" to coreCount,
         )
-        postAgentJson("$bufferUrl/agent/metrics", body)
+        if (perCoreCpu != null && perCoreCpu.isNotEmpty()) {
+            payload["perCoreCpu"] = perCoreCpu
+        }
+        postAgentJson("$bufferUrl/agent/metrics", gson.toJson(payload))
     }
 
     /** Lista skonfigurowanych rootów — widoczność w panelu od pierwszego cyklu. */
