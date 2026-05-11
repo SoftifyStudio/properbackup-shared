@@ -43,15 +43,23 @@ class RemoteTelemetry(private val global: GlobalConfig, private val machineId: S
     }
 
     /** Stan dla panelu (Spotlight-style): phase ∈ indexing | uploading | idle | waiting | error */
-    fun agentStatus(phase: String, detail: String? = null) {
+    fun agentStatus(
+        phase: String,
+        detail: String? = null,
+        totalFiles: Int? = null,
+        scannedFiles: Int? = null,
+        currentFile: String? = null,
+    ) {
         if (!enabled) return
-        val body = gson.toJson(
-            mapOf(
-                "machineId" to machineId,
-                "phase" to phase,
-                "detail" to detail,
-            ),
+        val map = linkedMapOf<String, Any?>(
+            "machineId" to machineId,
+            "phase" to phase,
+            "detail" to detail,
         )
+        if (totalFiles != null) map["totalFiles"] = totalFiles
+        if (scannedFiles != null) map["scannedFiles"] = scannedFiles
+        if (currentFile != null) map["currentFile"] = currentFile
+        val body = gson.toJson(map)
         post("$base/agent/status", body)
     }
 
