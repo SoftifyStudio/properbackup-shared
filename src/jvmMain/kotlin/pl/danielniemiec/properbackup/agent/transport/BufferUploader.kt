@@ -6,6 +6,8 @@ import java.net.URI
 import java.net.http.HttpClient
 import java.net.http.HttpRequest
 import java.net.http.HttpResponse
+import java.nio.file.Files
+import java.nio.file.Path
 import java.time.Duration
 
 class BufferUploader(
@@ -163,6 +165,34 @@ class BufferUploader(
         if (status == 503) throw IOException("Buffer full (503) — will retry later")
         if (status == 413) throw IOException("Payload too large (413)")
         if (status < 200 || status >= 300) throw IOException("Unexpected status: $status")
+    }
+
+    @Throws(Exception::class)
+    fun uploadFile(file: Path, pathId: String, originalPath: String, flag: String, serverId: String?) {
+        val size = Files.size(file)
+        if (bandwidthKbps > 0) {
+            val bytes = Files.readAllBytes(file)
+            uploadThrottled(bytes, pathId, originalPath, flag, serverId)
+        } else {
+            retry.execute {
+                val b = HttpRequest.newBuilder()
+                    .uri(URI.create("$bufferUrl/upload"))
+                    .timeout(Duration.ofMinutes(30))
+                    .header("Authorization", "Bearer $token")
+                    .header("X-Path-Id", pathId)
+                    .header("X-Original-Path", originalPath)
+                    .header("X-Flag", flag)
+                if (!serverId.isNullOrBlank()) {
+                    b.header("X-Server-Id", serverId)
+                }
+                val req = b.POST(HttpRequest.BodyPublishers.ofFile(file)).build()
+                val response = http.send(req, HttpResponse.BodyHandlers.discarding())
+                val status = response.statusCode()
+                if (status == 503) throw IOException("Buffer full (503) — will retry later")
+                if (status == 413) throw IOException("Payload too large (413) — ${size / 1024 / 1024}MB exceeds limit")
+                if (status < 200 || status >= 300) throw IOException("Unexpected status: $status")
+            }
+        }
     }
 
     override fun close() {

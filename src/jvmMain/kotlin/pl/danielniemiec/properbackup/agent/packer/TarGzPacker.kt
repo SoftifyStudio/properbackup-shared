@@ -3,6 +3,7 @@ package pl.danielniemiec.properbackup.agent.packer
 import org.apache.commons.compress.archivers.tar.TarArchiveEntry
 import org.apache.commons.compress.archivers.tar.TarArchiveOutputStream
 import org.apache.commons.compress.compressors.gzip.GzipCompressorOutputStream
+import java.io.BufferedOutputStream
 import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.OutputStream
@@ -56,5 +57,13 @@ object TarGzPacker {
         val buf = ByteArrayOutputStream()
         pack(rootDir, files, properbackupIdxJson, buf)
         return buf.toByteArray()
+    }
+
+    @JvmStatic
+    @Throws(IOException::class)
+    fun packToFile(rootDir: Path, files: List<Path>, properbackupIdxJson: ByteArray?, dest: Path) {
+        BufferedOutputStream(Files.newOutputStream(dest)).use { out ->
+            pack(rootDir, files, properbackupIdxJson, out)
+        }
     }
 }

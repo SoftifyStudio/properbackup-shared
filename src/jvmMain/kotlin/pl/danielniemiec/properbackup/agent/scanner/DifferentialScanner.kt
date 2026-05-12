@@ -5,10 +5,12 @@ import pl.danielniemiec.properbackup.core.filter.ExcludeFilter
 import pl.danielniemiec.properbackup.core.filter.ExcludePatterns
 import pl.danielniemiec.properbackup.core.filter.PrivacyAlertException
 import java.io.IOException
+import java.nio.channels.FileChannel
 import java.nio.file.FileVisitResult
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.SimpleFileVisitor
+import java.nio.file.StandardOpenOption
 import java.nio.file.attribute.BasicFileAttributes
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ForkJoinPool
@@ -151,20 +153,49 @@ class DifferentialScanner(excludeGlobs: List<String>?) {
         val prev = previousState[entry.rel]
         val needsHash = prev == null || prev.size != entry.size || prev.lastModified != entry.mtime
         val hash: Long = if (needsHash) {
-            try {
-                val bytes = Files.readAllBytes(entry.file)
-                LongHashFunction.xx3().hashBytes(bytes)
-            } catch (e: IOException) {
-                -1L
-            }
+            hashFile(entry.file, entry.mtime, entry.size)
         } else {
             prev!!.xxHash
         }
+        if (hash == HASH_UNSTABLE) return
         val meta = FileMetadata(entry.rel, entry.size, entry.mtime, hash)
         current[entry.rel] = meta
         if (prev == null || prev.xxHash != hash) {
             changed.add(entry.file)
         }
+    }
+
+    /**
+     * Hash a file using memory-mapped I/O (zero heap allocation for file content).
+     * Falls back to readAllBytes for files < MMAP_THRESHOLD or when mmap fails.
+     * Also performs a consistency check: if the file's mtime changed during read,
+     * it is being actively written to — return HASH_UNSTABLE so the caller skips it.
+     */
+    private fun hashFile(file: Path, preMtime: Long, expectedSize: Long): Long {
+        try {
+            val hash = if (expectedSize > MMAP_THRESHOLD) {
+                FileChannel.open(file, StandardOpenOption.READ).use { channel ->
+                    val buf = channel.map(FileChannel.MapMode.READ_ONLY, 0, channel.size())
+                    LongHashFunction.xx3().hashBytes(buf)
+                }
+            } else {
+                val bytes = Files.readAllBytes(file)
+                LongHashFunction.xx3().hashBytes(bytes)
+            }
+            val postMtime = Files.getLastModifiedTime(file).toMillis()
+            val postSize = Files.size(file)
+            if (postSize != expectedSize || postMtime != preMtime) {
+                return HASH_UNSTABLE
+            }
+            return hash
+        } catch (e: IOException) {
+            return -1L
+        }
+    }
+
+    companion object {
+        private const val MMAP_THRESHOLD = 512L * 1024
+        const val HASH_UNSTABLE = Long.MIN_VALUE
     }
 
     private data class FileEntry(val file: Path, val rel: String, val size: Long, val mtime: Long)
