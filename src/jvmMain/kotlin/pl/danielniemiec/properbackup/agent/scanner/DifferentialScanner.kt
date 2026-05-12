@@ -12,6 +12,8 @@ import java.nio.file.SimpleFileVisitor
 import java.nio.file.attribute.BasicFileAttributes
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ForkJoinPool
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 class DifferentialScanner(excludeGlobs: List<String>?) {
@@ -30,14 +32,30 @@ class DifferentialScanner(excludeGlobs: List<String>?) {
         excludeFilter = ExcludeFilter(merged)
     }
 
+    /**
+     * Progress callback fired periodically during scan.
+     * @param phase "discovering" while walking the file tree, "processing" while hashing
+     * @param current files discovered or processed so far
+     * @param total 0 during discovery (unknown), entries.size during processing
+     */
+    fun interface ProgressListener {
+        fun onProgress(phase: String, current: Int, total: Int)
+    }
+
     @Throws(IOException::class)
-    fun scan(rootDir: Path, previousState: Map<String, FileMetadata>): ScanResult {
+    fun scan(rootDir: Path, previousState: Map<String, FileMetadata>): ScanResult =
+        scan(rootDir, previousState, null)
+
+    @Throws(IOException::class)
+    fun scan(rootDir: Path, previousState: Map<String, FileMetadata>, progress: ProgressListener?): ScanResult {
         if (!Files.exists(rootDir)) {
             val deleted = ArrayList(previousState.keys)
             return ScanResult(emptyList(), deleted, emptyMap())
         }
 
         val entries = ArrayList<FileEntry>()
+        val lastProgressMs = AtomicLong(0)
+        val progressIntervalMs = 300L
         try {
             Files.walkFileTree(rootDir, object : SimpleFileVisitor<Path>() {
                 override fun visitFile(file: Path, attrs: BasicFileAttributes): FileVisitResult {
@@ -47,6 +65,13 @@ class DifferentialScanner(excludeGlobs: List<String>?) {
                         return FileVisitResult.CONTINUE
                     }
                     entries.add(FileEntry(file, rel, attrs.size(), attrs.lastModifiedTime().toMillis()))
+                    if (progress != null) {
+                        val now = System.currentTimeMillis()
+                        if (now - lastProgressMs.get() >= progressIntervalMs) {
+                            lastProgressMs.set(now)
+                            progress.onProgress("discovering", entries.size, 0)
+                        }
+                    }
                     return FileVisitResult.CONTINUE
                 }
 
@@ -69,9 +94,22 @@ class DifferentialScanner(excludeGlobs: List<String>?) {
         val cores = Runtime.getRuntime().availableProcessors()
         val parallelism = maxOf(1, cores - 1)
 
-        if (entries.size < 200 || parallelism <= 1) {
+        val total = entries.size
+        progress?.onProgress("processing", 0, total)
+        lastProgressMs.set(System.currentTimeMillis())
+        val processed = AtomicInteger(0)
+
+        if (total < 200 || parallelism <= 1) {
             for (e in entries) {
                 processEntry(e, previousState, current, changed)
+                if (progress != null) {
+                    val done = processed.incrementAndGet()
+                    val now = System.currentTimeMillis()
+                    if (now - lastProgressMs.get() >= progressIntervalMs) {
+                        lastProgressMs.set(now)
+                        progress.onProgress("processing", done, total)
+                    }
+                }
             }
         } else {
             val pool = ForkJoinPool(parallelism)
@@ -80,6 +118,14 @@ class DifferentialScanner(excludeGlobs: List<String>?) {
                     entries.parallelStream().forEach { e ->
                         try {
                             processEntry(e, previousState, current, changed)
+                            if (progress != null) {
+                                val done = processed.incrementAndGet()
+                                val now = System.currentTimeMillis()
+                                if (now - lastProgressMs.get() >= progressIntervalMs) {
+                                    lastProgressMs.set(now)
+                                    progress.onProgress("processing", done, total)
+                                }
+                            }
                         } catch (t: Throwable) {
                             firstError.compareAndSet(null, t)
                         }
@@ -90,6 +136,7 @@ class DifferentialScanner(excludeGlobs: List<String>?) {
             }
             firstError.get()?.let { throw IOException("Parallel scan error", it) }
         }
+        progress?.onProgress("processing", total, total)
 
         val deleted = previousState.keys.filter { !current.containsKey(it) }
         return ScanResult(ArrayList(changed), deleted, HashMap(current))
