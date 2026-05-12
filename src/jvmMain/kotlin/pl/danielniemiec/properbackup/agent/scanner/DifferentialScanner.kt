@@ -157,7 +157,10 @@ class DifferentialScanner(excludeGlobs: List<String>?) {
         } else {
             prev!!.xxHash
         }
-        if (hash == HASH_UNSTABLE) return
+        if (hash == HASH_UNSTABLE) {
+            if (prev != null) current[entry.rel] = prev
+            return
+        }
         val meta = FileMetadata(entry.rel, entry.size, entry.mtime, hash)
         current[entry.rel] = meta
         if (prev == null || prev.xxHash != hash) {
