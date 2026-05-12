@@ -169,10 +169,11 @@ class DifferentialScanner(excludeGlobs: List<String>?) {
     }
 
     /**
-     * Hash a file using memory-mapped I/O (zero heap allocation for file content).
-     * Falls back to readAllBytes for files < MMAP_THRESHOLD or when mmap fails.
-     * Also performs a consistency check: if the file's mtime changed during read,
-     * it is being actively written to — return HASH_UNSTABLE so the caller skips it.
+     * Hash a file and perform a consistency check.
+     * Uses mmap for large files (zero heap — OS manages page cache).
+     * If the file's mtime or size changed during read, it is being actively written to
+     * (e.g. by a game server with 100 players) — return HASH_UNSTABLE so the caller
+     * skips it and retries next cycle.
      */
     private fun hashFile(file: Path, preMtime: Long, expectedSize: Long): Long {
         try {
@@ -182,8 +183,7 @@ class DifferentialScanner(excludeGlobs: List<String>?) {
                     LongHashFunction.xx3().hashBytes(buf)
                 }
             } else {
-                val bytes = Files.readAllBytes(file)
-                LongHashFunction.xx3().hashBytes(bytes)
+                LongHashFunction.xx3().hashBytes(Files.readAllBytes(file))
             }
             val postMtime = Files.getLastModifiedTime(file).toMillis()
             val postSize = Files.size(file)
