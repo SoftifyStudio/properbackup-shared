@@ -18,7 +18,7 @@ class ActivationClient(private val bufferUrl: String) {
 
     data class SessionPayload(val token: String, val email: String, val id: String, val isSystemAdmin: Boolean)
 
-    data class ActivationResult(val serverId: String, val name: String, val session: Optional<SessionPayload>)
+    data class ActivationResult(val serverId: String, val name: String, val uploadToken: String, val session: Optional<SessionPayload>)
 
     @Throws(IOException::class, InterruptedException::class)
     fun activate(token: String, includeAuth: Boolean): ActivationResult {
@@ -57,7 +57,8 @@ class ActivationClient(private val bufferUrl: String) {
                 ),
             )
         }
-        return ActivationResult(serverId, name, session)
+        val uploadTk = if (o.has("uploadToken")) o.get("uploadToken").asString else ""
+        return ActivationResult(serverId, name, uploadTk, session)
     }
 
     private fun getHostname(): String = try {
