@@ -2,6 +2,10 @@ plugins {
     kotlin("multiplatform")
 }
 
+repositories {
+    mavenCentral()
+}
+
 kotlin {
     jvmToolchain(21)
     jvm()
