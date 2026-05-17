@@ -11,6 +11,8 @@ class GlobalConfig {
         var encryption_password: String = ""
         var state_dir: String = System.getProperty("java.io.tmpdir") + "/properbackup"
         var upload_bandwidth_kbps: Int = 0
+        var io_read_rate_mbps: Int = 50
+        var max_cpu_percent: Int = 25
         var server_id: String = ""
         var poll_interval_seconds: Int = 300
         var panel_url: String = ""

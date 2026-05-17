@@ -1,6 +1,7 @@
 package pl.danielniemiec.properbackup.agent.scanner
 
 import net.openhft.hashing.LongHashFunction
+import pl.danielniemiec.properbackup.agent.throttle.IoThrottle
 import pl.danielniemiec.properbackup.core.filter.ExcludeFilter
 import pl.danielniemiec.properbackup.core.filter.ExcludePatterns
 import pl.danielniemiec.properbackup.core.filter.PrivacyAlertException
@@ -14,7 +15,10 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.ForkJoinPool
 import java.util.concurrent.atomic.AtomicReference
 
-class DifferentialScanner(excludeGlobs: List<String>?) {
+class DifferentialScanner(
+    excludeGlobs: List<String>?,
+    private val ioThrottle: IoThrottle = IoThrottle.unlimited(),
+) {
 
     data class ScanResult(
         val changedFiles: List<Path>,
@@ -105,7 +109,7 @@ class DifferentialScanner(excludeGlobs: List<String>?) {
         val needsHash = prev == null || prev.size != entry.size || prev.lastModified != entry.mtime
         val hash: Long = if (needsHash) {
             try {
-                val bytes = Files.readAllBytes(entry.file)
+                val bytes = ioThrottle.readAllBytes(entry.file)
                 LongHashFunction.xx3().hashBytes(bytes)
             } catch (e: IOException) {
                 -1L
