@@ -491,5 +491,22 @@ class RestoreOrchestrator(
             val digest = MessageDigest.getInstance("SHA-256")
             return digest.digest(data).joinToString("") { "%02x".format(it) }
         }
+
+        @JvmStatic
+        fun extractTarGzStatic(tarGzData: ByteArray): Map<String, ByteArray> {
+            val result = mutableMapOf<String, ByteArray>()
+            GzipCompressorInputStream(ByteArrayInputStream(tarGzData)).use { gzip ->
+                TarArchiveInputStream(gzip).use { tar ->
+                    var entry = tar.nextEntry
+                    while (entry != null) {
+                        if (!entry.isDirectory && entry.name != ".properbackup-idx") {
+                            result[entry.name] = tar.readNBytes(entry.size.toInt())
+                        }
+                        entry = tar.nextEntry
+                    }
+                }
+            }
+            return result
+        }
     }
 }
