@@ -319,6 +319,7 @@ class RestoreOrchestrator(
                             if (fileData != null) {
                                 restoreFileDirectly(op, fileData, stateStore)
                                 reporter.trackRestored(op.sizeBytes)
+                                reporter.reportFileRestored(op.path, op.sha256Target, op.sizeBytes)
                                 restored++
                             } else {
                                 op.state = OperationState.FAILED
@@ -330,6 +331,7 @@ class RestoreOrchestrator(
                         OperationType.DELETE -> {
                             fileDeleter.delete(op)
                             reporter.trackDeleted()
+                            reporter.reportFileDeleted(op.path)
                             deleted++
                         }
                         OperationType.SKIP -> {

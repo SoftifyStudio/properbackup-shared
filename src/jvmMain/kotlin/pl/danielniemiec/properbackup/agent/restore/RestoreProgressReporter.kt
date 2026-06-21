@@ -22,6 +22,8 @@ class RestoreProgressReporter(
     private var pendingBytes = 0L
     private var lastReportTime = System.currentTimeMillis()
 
+    private val pendingFileEvents = mutableListOf<Map<String, Any?>>()
+
     fun trackRestored(bytes: Long) {
         pendingRestored++
         pendingBytes += bytes
@@ -33,6 +35,48 @@ class RestoreProgressReporter(
         maybeFlush()
     }
 
+    fun reportFileRestored(path: String, sha256: String?, sizeBytes: Long) {
+        pendingFileEvents.add(mapOf(
+            "action" to "RECOVERY_FILE_RESTORED",
+            "path" to path,
+            "sha256" to sha256,
+            "size_bytes" to sizeBytes,
+        ))
+        maybeFlushFileEvents()
+    }
+
+    fun reportFileDeleted(path: String) {
+        pendingFileEvents.add(mapOf(
+            "action" to "RECOVERY_FILE_DELETED",
+            "path" to path,
+        ))
+        maybeFlushFileEvents()
+    }
+
+    private fun maybeFlushFileEvents() {
+        if (pendingFileEvents.size >= BATCH_SIZE) {
+            flushFileEvents()
+        }
+    }
+
+    fun flushFileEvents() {
+        if (pendingFileEvents.isEmpty()) return
+        try {
+            val body = gson.toJson(mapOf("events" to pendingFileEvents.toList()))
+            val req = HttpRequest.newBuilder()
+                .uri(URI.create("$bufferUrl/agent/recovery/$sessionId/file_audit"))
+                .timeout(Duration.ofSeconds(15))
+                .header("Authorization", "Bearer $token")
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(body))
+                .build()
+            http.send(req, HttpResponse.BodyHandlers.discarding())
+        } catch (e: Exception) {
+            System.err.println("[restore] file audit report failed: ${e.message}")
+        }
+        pendingFileEvents.clear()
+    }
+
     private fun maybeFlush() {
         val total = pendingRestored + pendingDeleted
         val elapsed = System.currentTimeMillis() - lastReportTime
@@ -42,6 +86,7 @@ class RestoreProgressReporter(
     }
 
     fun flush() {
+        flushFileEvents()
         if (pendingRestored == 0 && pendingDeleted == 0) return
         try {
             val body = gson.toJson(mapOf(
