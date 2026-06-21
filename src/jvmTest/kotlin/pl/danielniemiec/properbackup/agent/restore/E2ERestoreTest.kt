@@ -16,10 +16,6 @@ import java.nio.file.Path
 import java.security.MessageDigest
 import java.util.UUID
 
-/**
- * Full pipeline E2E test: create tar.gz → encrypt → decrypt → extract → atomic write → verify SHA-256.
- * Proves the complete restore protocol works end-to-end.
- */
 class E2ERestoreTest {
 
     @TempDir
@@ -82,7 +78,6 @@ class E2ERestoreTest {
 
     @Test
     fun `full pipeline - 4 files encrypt decrypt extract write verify`() {
-        // Step 1: Create test files matching E2E dataset
         val testFiles = mapOf(
             "README.txt" to "ProperBackup E2E Test Dataset\nThis is a test file for restore verification.\n".toByteArray(),
             "binary-sample.bin" to ByteArray(512 * 1024) { (it % 256).toByte() },
@@ -91,30 +86,15 @@ class E2ERestoreTest {
         )
 
         val expectedHashes = testFiles.mapValues { sha256(it.value) }
-        println("[E2E] Test files:")
-        testFiles.forEach { (name, data) ->
-            println("  $name: ${data.size} bytes, SHA-256=${expectedHashes[name]!!.substring(0, 16)}...")
-        }
 
-        // Step 2: Create tar.gz
         val tarGz = createTestTarGz(testFiles)
-        println("[E2E] tar.gz: ${tarGz.size} bytes")
-
-        // Step 3: Encrypt with ProperCrypto
         val encrypted = encrypt(PASSWORD, tarGz)
-        println("[E2E] Encrypted: ${encrypted.size} bytes")
-
-        // Step 4: Decrypt
         val decrypted = decrypt(PASSWORD, encrypted)
-        assertArrayEquals(tarGz, decrypted, "Decrypted data should match original tar.gz")
-        println("[E2E] Decrypted: ${decrypted.size} bytes (matches original)")
+        assertArrayEquals(tarGz, decrypted)
 
-        // Step 5: Extract tar.gz
         val extracted = extractTarGz(decrypted)
-        assertEquals(testFiles.size, extracted.size, "Should extract same number of files")
-        println("[E2E] Extracted ${extracted.size} files from archive")
+        assertEquals(testFiles.size, extracted.size)
 
-        // Step 6: Prepare restore components
         val stateFile = tempDir.resolve("restore_state.json")
         val stateStore = RestoreStateStore(stateFile)
         val restoreDir = tempDir.resolve("restored-files")
@@ -125,14 +105,11 @@ class E2ERestoreTest {
         Files.createDirectories(stateDir)
 
         val guard = CriticalPathsGuard(configDir, stateDir)
-        val fileRestorer = FileRestorer(stateStore) { it } // identity decrypt (already decrypted)
-        val quarantineDir = tempDir.resolve("quarantine")
-        val deleter = FileDeleter(quarantineDir, "e2e-session-001", stateStore)
+        val fileRestorer = FileRestorer(stateStore) { it }
 
-        // Step 7: Create operations
         val operations = extracted.map { (name, data) ->
             val targetPath = restoreDir.resolve(name)
-            assertFalse(guard.isProtected(targetPath.toString()), "Test files should not be protected")
+            assertFalse(guard.isProtected(targetPath.toString()))
             RecoveryOperation(
                 id = UUID.randomUUID().toString(),
                 type = OperationType.RESTORE,
@@ -142,41 +119,29 @@ class E2ERestoreTest {
             )
         }
         stateStore.save(operations)
-        println("[E2E] Created ${operations.size} restore operations")
 
-        // Step 8: Execute atomic restore
-        var restoredCount = 0
         for (op in operations) {
             val relativePath = restoreDir.relativize(Path.of(op.path)).toString()
-            val fileData = extracted[relativePath]!!
-            fileRestorer.restore(op, fileData)
-            assertEquals(OperationState.DONE, op.state, "Operation should be DONE for $relativePath")
-            restoredCount++
+            fileRestorer.restore(op, extracted[relativePath]!!)
+            assertEquals(OperationState.DONE, op.state)
         }
-        println("[E2E] Restored $restoredCount files atomically")
 
-        // Step 9: Verify SHA-256 of all restored files
         for (op in operations) {
             val targetPath = Path.of(op.path)
-            assertTrue(Files.exists(targetPath), "File should exist on disk: ${op.path}")
+            assertTrue(Files.exists(targetPath))
             val written = Files.readAllBytes(targetPath)
             val writtenHash = sha256(written)
-            assertEquals(op.sha256Target, writtenHash, "SHA-256 must match for ${targetPath.fileName}")
+            assertEquals(op.sha256Target, writtenHash)
             val originalName = restoreDir.relativize(targetPath).toString()
-            assertEquals(expectedHashes[originalName], writtenHash, "Hash must match original for $originalName")
-            println("[E2E] VERIFIED: $originalName SHA-256=${writtenHash.substring(0, 16)}... (${written.size} bytes)")
+            assertEquals(expectedHashes[originalName], writtenHash)
         }
 
-        // Step 10: Verify state store recorded completion
         val finalState = stateStore.load()
-        assertTrue(finalState.all { it.state == "DONE" }, "All operations should be DONE in state store")
-        println("[E2E] State store: all ${finalState.size} operations DONE")
-
-        println("[E2E] FULL PIPELINE VERIFIED: encrypt -> decrypt -> extract -> atomic write -> SHA-256 match")
+        assertTrue(finalState.all { it.state == "DONE" })
     }
 
     @Test
-    fun `resume after crash - restore only non-done operations`() {
+    fun `HR-7 resume after crash - restore only non-done operations`() {
         val testFiles = mapOf(
             "a.txt" to "file A".toByteArray(),
             "b.txt" to "file B".toByteArray(),
@@ -212,17 +177,22 @@ class E2ERestoreTest {
         fileRestorer.restore(firstOp, extracted[firstName]!!)
         stateStore.markState(firstOp.id, OperationState.DONE)
 
-        // Simulate restart: load state, skip DONE operations
-        val savedState = stateStore.load()
-        val doneIds = savedState.filter { it.state == "DONE" }.map { it.id }.toSet()
-        assertEquals(1, doneIds.size, "Should have 1 DONE operation after crash")
+        // Simulate restart: load FULL operations from state store (HR-7)
+        val reconstructed = stateStore.loadOperations()!!
+        assertEquals(3, reconstructed.size)
+        val doneOps = reconstructed.filter { it.state == OperationState.DONE }
+        assertEquals(1, doneOps.size, "Should have 1 DONE operation after crash")
 
-        // Resume: restore remaining
+        // Resume: restore remaining (skip DONE, reset non-terminal states to PENDING)
         var resumed = 0
-        for (op in ops) {
-            if (doneIds.contains(op.id)) {
-                println("[E2E] Skipping DONE: ${Path.of(op.path).fileName}")
+        for (op in reconstructed) {
+            if (op.state.isTerminal) {
+                println("[HR-7] Skipping ${op.state}: ${Path.of(op.path).fileName}")
                 continue
+            }
+            // Reset mid-progress states to PENDING (crash recovery)
+            if (op.state != OperationState.PENDING) {
+                op.state = OperationState.PENDING
             }
             val name = restoreDir.relativize(Path.of(op.path)).toString()
             fileRestorer.restore(op, extracted[name]!!)
@@ -230,58 +200,82 @@ class E2ERestoreTest {
             resumed++
         }
 
-        assertEquals(ops.size - 1, resumed, "Should resume ${ops.size - 1} operations")
+        assertEquals(ops.size - 1, resumed)
 
-        // Verify all files
+        // Verify all files exist with correct hash
         for (op in ops) {
             val targetPath = Path.of(op.path)
             assertTrue(Files.exists(targetPath))
             assertEquals(op.sha256Target, sha256(Files.readAllBytes(targetPath)))
         }
-        println("[E2E] Resume-on-crash: verified ${ops.size} files after simulated crash")
+        println("[HR-7] Resume-on-crash: verified ${ops.size} files after simulated crash+restart")
     }
 
     @Test
-    fun `quarantine delete and rollback`() {
-        val stateFile = tempDir.resolve("delete_state.json")
+    fun `HR-9 cancel rollback - restored files deleted, quarantined files returned`() {
+        val stateFile = tempDir.resolve("cancel_state.json")
         val stateStore = RestoreStateStore(stateFile)
+        val restoreDir = tempDir.resolve("cancel-restore")
         val quarantineDir = tempDir.resolve("quarantine")
-        val deleter = FileDeleter(quarantineDir, "e2e-delete-session", stateStore)
+        Files.createDirectories(restoreDir)
 
-        // Create files to delete
-        val fileToDelete = tempDir.resolve("data/delete-me.txt")
-        Files.createDirectories(fileToDelete.parent)
-        Files.writeString(fileToDelete, "This file should be quarantined")
+        val fileRestorer = FileRestorer(stateStore) { it }
+        val fileDeleter = FileDeleter(quarantineDir, "cancel-session", stateStore)
 
-        val op = RecoveryOperation(
+        // Setup: create a file that will be "deleted" during restore
+        val existingFile = restoreDir.resolve("existing.txt")
+        Files.writeString(existingFile, "original content")
+
+        // Create ops: 1 restore + 1 delete
+        val restoreOp = RecoveryOperation(
+            id = UUID.randomUUID().toString(),
+            type = OperationType.RESTORE,
+            path = restoreDir.resolve("new-file.txt").toString(),
+            sha256Target = sha256("new content".toByteArray()),
+            sizeBytes = 11,
+        )
+        val deleteOp = RecoveryOperation(
             id = UUID.randomUUID().toString(),
             type = OperationType.DELETE,
-            path = fileToDelete.toString(),
+            path = existingFile.toString(),
+            sha256Local = sha256("original content".toByteArray()),
         )
-        stateStore.save(listOf(op))
+        stateStore.save(listOf(restoreOp, deleteOp))
 
-        // Delete (quarantine)
-        deleter.delete(op)
-        assertFalse(Files.exists(fileToDelete), "Original file should be removed")
-        assertEquals(OperationState.DONE, op.state)
-        println("[E2E] File quarantined: ${fileToDelete.fileName}")
+        // Execute restore op
+        fileRestorer.restore(restoreOp, "new content".toByteArray())
+        assertEquals(OperationState.DONE, restoreOp.state)
+        assertTrue(Files.exists(Path.of(restoreOp.path)))
 
-        // Rollback
-        deleter.rollback()
-        assertTrue(Files.exists(fileToDelete), "File should be restored from quarantine")
-        assertEquals("This file should be quarantined", Files.readString(fileToDelete))
-        println("[E2E] Rollback verified: file restored from quarantine")
+        // Execute delete op (quarantines file)
+        fileDeleter.delete(deleteOp)
+        assertEquals(OperationState.DONE, deleteOp.state)
+        assertFalse(Files.exists(existingFile))
+
+        // ─── CANCEL! Simulate cancel rollback ───
+        // 1. Delete restored files
+        val restoredPath = Path.of(restoreOp.path)
+        if (Files.exists(restoredPath)) {
+            Files.delete(restoredPath)
+        }
+        assertFalse(Files.exists(restoredPath), "Restored file should be removed on cancel")
+
+        // 2. Restore quarantined files
+        fileDeleter.rollback()
+        assertTrue(Files.exists(existingFile), "Quarantined file should be restored on cancel")
+        assertEquals("original content", Files.readString(existingFile))
+
+        println("[HR-9] Cancel rollback: restored file removed, quarantined file returned")
     }
 
     @Test
-    fun `critical paths guard blocks system paths`() {
+    fun `HR-8 critical paths guard blocks system paths and logs`() {
         val configDir = tempDir.resolve("config")
         val stateDir = tempDir.resolve("state")
         Files.createDirectories(configDir)
         Files.createDirectories(stateDir)
         val guard = CriticalPathsGuard(configDir, stateDir)
 
-        // These should be blocked
         val blockedPaths = listOf(
             "/proc/cpuinfo", "/sys/devices", "/dev/null", "/run/user/1000",
             "/boot/vmlinuz", "/etc/passwd", "/etc/shadow",
@@ -293,7 +287,6 @@ class E2ERestoreTest {
             assertTrue(guard.isProtected(path), "Should block: $path")
         }
 
-        // These should be allowed
         val allowedPaths = listOf(
             "/home/user/data/file.txt",
             "/var/www/html/index.html",
@@ -302,6 +295,124 @@ class E2ERestoreTest {
         for (path in allowedPaths) {
             assertFalse(guard.isProtected(path), "Should allow: $path")
         }
-        println("[E2E] CriticalPathsGuard: blocked ${blockedPaths.size} system paths, allowed ${allowedPaths.size} user paths")
+
+        // Verify that protected paths would generate SKIP operations (not RESTORE/DELETE)
+        val stateFile = tempDir.resolve("guard_state.json")
+        val stateStore = RestoreStateStore(stateFile)
+        val ops = mutableListOf<RecoveryOperation>()
+        for (path in blockedPaths + allowedPaths) {
+            if (guard.isProtected(path)) {
+                ops.add(RecoveryOperation(
+                    id = UUID.randomUUID().toString(),
+                    type = OperationType.SKIP,
+                    path = path,
+                    state = OperationState.DONE,
+                ))
+            } else {
+                ops.add(RecoveryOperation(
+                    id = UUID.randomUUID().toString(),
+                    type = OperationType.RESTORE,
+                    path = path,
+                ))
+            }
+        }
+        stateStore.save(ops)
+
+        val skipCount = ops.count { it.type == OperationType.SKIP }
+        val restoreCount = ops.count { it.type == OperationType.RESTORE }
+        assertEquals(blockedPaths.size, skipCount, "All blocked paths should be SKIP")
+        assertEquals(allowedPaths.size, restoreCount, "All allowed paths should be RESTORE")
+        println("[HR-8] Guard: blocked=${blockedPaths.size}, allowed=${allowedPaths.size}")
+    }
+
+    @Test
+    fun `HR-5 pre-recovery snapshot stores current file manifest`() {
+        // Simulate pre-recovery: scan current files, store manifest
+        val sourceDir = tempDir.resolve("pre-snapshot-source")
+        Files.createDirectories(sourceDir)
+        Files.writeString(sourceDir.resolve("config.yml"), "buffer_url: http://test")
+        Files.writeString(sourceDir.resolve("data.bin"), "binary data here")
+
+        // Scan files (simulates what createPreRecoverySnapshot does)
+        val localFiles = mutableListOf<Map<String, Any>>()
+        Files.walk(sourceDir).filter { Files.isRegularFile(it) }.forEach { file ->
+            val data = Files.readAllBytes(file)
+            localFiles.add(mapOf(
+                "path" to file.toAbsolutePath().normalize().toString(),
+                "sha256" to sha256(data),
+                "size" to data.size.toLong(),
+            ))
+        }
+
+        assertEquals(2, localFiles.size, "Should have 2 files in pre-recovery snapshot")
+        assertTrue(localFiles.all { (it["sha256"] as String).length == 64 }, "All files should have valid SHA-256")
+        assertTrue(localFiles.all { (it["size"] as Long) > 0 }, "All files should have positive size")
+
+        // Verify manifest contains correct data
+        val configFile = localFiles.find { (it["path"] as String).endsWith("config.yml") }
+        assertNotNull(configFile)
+        assertEquals(sha256("buffer_url: http://test".toByteArray()), configFile!!["sha256"])
+
+        println("[HR-5] Pre-recovery snapshot manifest: ${localFiles.size} files captured")
+    }
+
+    @Test
+    fun `HR-7 resume resets mid-progress states to allow retry`() {
+        val stateFile = tempDir.resolve("mid_progress.json")
+        val stateStore = RestoreStateStore(stateFile)
+        val restoreDir = tempDir.resolve("mid-progress-restore")
+        Files.createDirectories(restoreDir)
+
+        val fileRestorer = FileRestorer(stateStore) { it }
+
+        val ops = listOf(
+            RecoveryOperation("done-op", OperationType.RESTORE, restoreDir.resolve("done.txt").toString(),
+                sha256Target = sha256("done content".toByteArray()), sizeBytes = 12),
+            RecoveryOperation("writing-op", OperationType.RESTORE, restoreDir.resolve("writing.txt").toString(),
+                sha256Target = sha256("writing content".toByteArray()), sizeBytes = 15),
+            RecoveryOperation("pending-op", OperationType.RESTORE, restoreDir.resolve("pending.txt").toString(),
+                sha256Target = sha256("pending content".toByteArray()), sizeBytes = 15),
+        )
+        stateStore.save(ops)
+
+        // First op completed before crash
+        fileRestorer.restore(ops[0], "done content".toByteArray())
+        stateStore.markState("done-op", OperationState.DONE)
+
+        // Second op was mid-WRITING when crash occurred
+        stateStore.markState("writing-op", OperationState.WRITING)
+
+        // Simulate restart
+        val reconstructed = stateStore.loadOperations()!!
+        assertEquals(OperationState.DONE, reconstructed[0].state)
+        assertEquals(OperationState.WRITING, reconstructed[1].state) // mid-progress
+        assertEquals(OperationState.PENDING, reconstructed[2].state)
+
+        // Resume: skip DONE, reset WRITING→PENDING, execute remaining
+        var resumed = 0
+        for (op in reconstructed) {
+            if (op.state == OperationState.DONE) continue
+            // Reset any mid-progress state
+            if (op.state != OperationState.PENDING && !op.state.isTerminal) {
+                op.state = OperationState.PENDING
+            }
+            val name = restoreDir.relativize(Path.of(op.path)).toString()
+            val content = when (name) {
+                "writing.txt" -> "writing content"
+                "pending.txt" -> "pending content"
+                else -> error("unexpected: $name")
+            }
+            fileRestorer.restore(op, content.toByteArray())
+            stateStore.markState(op.id, OperationState.DONE)
+            resumed++
+        }
+        assertEquals(2, resumed, "Should resume 2 ops (skip 1 DONE)")
+
+        // All files exist with correct content
+        for (op in ops) {
+            assertTrue(Files.exists(Path.of(op.path)))
+            assertEquals(op.sha256Target, sha256(Files.readAllBytes(Path.of(op.path))))
+        }
+        println("[HR-7] Mid-progress resume: 2 ops resumed after WRITING-state crash")
     }
 }
