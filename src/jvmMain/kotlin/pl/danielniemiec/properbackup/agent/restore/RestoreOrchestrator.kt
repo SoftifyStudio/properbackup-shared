@@ -35,6 +35,7 @@ class RestoreOrchestrator(
     private val stateDir: Path,
     private val configDir: Path,
     private val backupRoots: List<String>,
+    private val jwtToken: String = "",
 ) {
     private val http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(30)).build()
     private val gson = Gson()
@@ -150,6 +151,10 @@ class RestoreOrchestrator(
         val fileDeleter = FileDeleter(quarantineDir, cmd.sessionId, stateStore)
 
         cancelRequested.set(false)
+        var earlyDecryptedArchive: Map<String, ByteArray>? = null
+
+        // Signal to buffer that agent is starting restore
+        reporter.reportStarted()
 
         try {
             // ─── HR-7: Resume support ───
@@ -169,10 +174,38 @@ class RestoreOrchestrator(
                 val preSnapshotId = createPreRecoverySnapshot(cmd.sessionId)
                 println("[restore] [HR-5] Pre-recovery snapshot created: id=$preSnapshotId")
 
-                // Fetch snapshot data and compute operations
-                val snapshotFiles = fetchSnapshotFiles(cmd.targetSnapshotId)
-                if (snapshotFiles == null) {
-                    reporter.reportComplete(false, "Cannot fetch snapshot manifest")
+                // Download the archive first (needed to derive file list if endpoint unavailable)
+                val earlyArchiveData = downloadArchivePack(cmd.targetSnapshotId)
+                if (earlyArchiveData == null) {
+                    reporter.reportComplete(false, "Cannot download archive pack")
+                    return
+                }
+                earlyDecryptedArchive = extractTarGz(decrypt(earlyArchiveData))
+                println("[restore] Archive decrypted: ${earlyDecryptedArchive!!.size} files extracted")
+
+                // Try to fetch snapshot manifest from buffer endpoint
+                var snapshotFiles = fetchSnapshotFiles(cmd.targetSnapshotId)
+
+                // Fallback: derive file list from extracted archive contents
+                if (snapshotFiles == null && earlyDecryptedArchive!!.isNotEmpty()) {
+                    println("[restore] Deriving file list from archive contents (${earlyDecryptedArchive!!.size} files)")
+                    snapshotFiles = earlyDecryptedArchive!!.map { (entryName, data) ->
+                        // Resolve path relative to first backup root
+                        val restorePath = if (backupRoots.isNotEmpty()) {
+                            Path.of(backupRoots[0]).resolve(entryName).toAbsolutePath().normalize().toString()
+                        } else {
+                            entryName
+                        }
+                        SnapshotFile(
+                            path = restorePath,
+                            sha256 = sha256(data),
+                            sizeBytes = data.size.toLong(),
+                        )
+                    }
+                }
+
+                if (snapshotFiles == null || snapshotFiles.isEmpty()) {
+                    reporter.reportComplete(false, "Cannot determine file list for restore")
                     return
                 }
 
@@ -249,9 +282,13 @@ class RestoreOrchestrator(
             var deleted = 0
             var skipped = 0
 
-            // Download archive pack (once) for all RESTORE ops
-            val archiveData = downloadArchivePack(cmd.targetSnapshotId)
-            val extractedFiles = if (archiveData != null) extractTarGz(decrypt(archiveData)) else emptyMap()
+            // Use already-downloaded archive if available, otherwise download now
+            val extractedFiles = if (earlyDecryptedArchive != null) {
+                earlyDecryptedArchive!!
+            } else {
+                val archiveData = downloadArchivePack(cmd.targetSnapshotId)
+                if (archiveData != null) extractTarGz(decrypt(archiveData)) else emptyMap()
+            }
 
             for (op in operations) {
                 // ─── HR-9: Check cancel ───
@@ -272,7 +309,13 @@ class RestoreOrchestrator(
                 try {
                     when (op.type) {
                         OperationType.RESTORE -> {
+                            // Look up file data by full path or entry name
                             val fileData = extractedFiles[op.path]
+                                ?: extractedFiles[Path.of(op.path).fileName.toString()]
+                                ?: backupRoots.firstNotNullOfOrNull { root ->
+                                    val relative = try { Path.of(root).relativize(Path.of(op.path)).toString() } catch (_: Exception) { null }
+                                    relative?.let { extractedFiles[it] }
+                                }
                             if (fileData != null) {
                                 restoreFileDirectly(op, fileData, stateStore)
                                 reporter.trackRestored(op.sizeBytes)
@@ -495,7 +538,8 @@ class RestoreOrchestrator(
     data class SnapshotFile(val path: String, val sha256: String, val sizeBytes: Long)
 
     private fun fetchSnapshotFiles(snapshotId: Long): List<SnapshotFile>? {
-        return try {
+        // Try dedicated agent endpoint first
+        try {
             val req = HttpRequest.newBuilder()
                 .uri(URI.create("$bufferUrl/agent/snapshot/$snapshotId/files"))
                 .timeout(Duration.ofSeconds(30))
@@ -504,12 +548,9 @@ class RestoreOrchestrator(
                 .GET()
                 .build()
             val res = http.send(req, HttpResponse.BodyHandlers.ofString())
-            if (res.statusCode() != 200) {
-                System.err.println("[restore] Snapshot files fetch failed: ${res.statusCode()} ${res.body()}")
-                null
-            } else {
+            if (res.statusCode() == 200) {
                 val arr = JsonParser.parseString(res.body()).asJsonArray
-                arr.map { el ->
+                return arr.map { el ->
                     val o = el.asJsonObject
                     SnapshotFile(
                         path = o.get("path").asString,
@@ -518,14 +559,17 @@ class RestoreOrchestrator(
                     )
                 }
             }
+            println("[restore] /agent/snapshot/$snapshotId/files returned ${res.statusCode()}, will derive from archive")
         } catch (e: Exception) {
-            System.err.println("[restore] Snapshot files fetch failed: ${e.message}")
-            null
+            println("[restore] fetchSnapshotFiles direct endpoint unavailable: ${e.message}")
         }
+        // Fallback: return null — caller will derive file list from archive contents
+        return null
     }
 
     private fun downloadArchivePack(snapshotId: Long): ByteArray? {
-        return try {
+        // Strategy 1: Try dedicated agent endpoint
+        try {
             val req = HttpRequest.newBuilder()
                 .uri(URI.create("$bufferUrl/agent/snapshot/$snapshotId/download"))
                 .timeout(Duration.ofMinutes(10))
@@ -534,24 +578,93 @@ class RestoreOrchestrator(
                 .GET()
                 .build()
             val res = http.send(req, HttpResponse.BodyHandlers.ofByteArray())
-            if (res.statusCode() != 200) {
-                System.err.println("[restore] Direct download failed (${res.statusCode()}), trying object name lookup...")
-                downloadByObjectName(snapshotId)
-            } else {
-                res.body()
+            if (res.statusCode() == 200) {
+                println("[restore] Downloaded archive via /agent/snapshot/$snapshotId/download (${res.body().size} bytes)")
+                return res.body()
             }
+            println("[restore] Direct download returned ${res.statusCode()}, trying object name lookup...")
         } catch (e: Exception) {
-            System.err.println("[restore] Archive download failed: ${e.message}")
-            downloadByObjectName(snapshotId)
+            println("[restore] Direct download failed: ${e.message}, trying object name lookup...")
         }
+
+        // Strategy 2: Look up object_name via archive-snapshots, download via /objects/{name}
+        return downloadByObjectName(snapshotId)
     }
 
-    @Suppress("UNUSED_PARAMETER")
     private fun downloadByObjectName(snapshotId: Long): ByteArray? {
-        return try {
+        val authToken = jwtToken.ifBlank { token }
+        try {
+            // Get the object name from archive-snapshots endpoint
+            val objectName = lookupObjectName(snapshotId, authToken)
+            if (objectName != null) {
+                println("[restore] Found object: $objectName, downloading...")
+                val downloadReq = HttpRequest.newBuilder()
+                    .uri(URI.create("$bufferUrl/objects/$objectName"))
+                    .timeout(Duration.ofMinutes(10))
+                    .header("Authorization", "Bearer $authToken")
+                    .GET()
+                    .build()
+                val downloadRes = http.send(downloadReq, HttpResponse.BodyHandlers.ofByteArray())
+                if (downloadRes.statusCode() == 200) {
+                    println("[restore] Downloaded $objectName (${downloadRes.body().size} bytes)")
+                    return downloadRes.body()
+                }
+                System.err.println("[restore] Object download failed: ${downloadRes.statusCode()}")
+            }
+        } catch (e: Exception) {
+            System.err.println("[restore] Object name download failed: ${e.message}")
+        }
+
+        // Strategy 3: Try listing objects (legacy fallback)
+        return downloadByObjectListing(authToken)
+    }
+
+    private fun lookupObjectName(snapshotId: Long, authToken: String): String? {
+        try {
+            val req = HttpRequest.newBuilder()
+                .uri(URI.create("$bufferUrl/servers/$serverId/archive-snapshots"))
+                .timeout(Duration.ofSeconds(30))
+                .header("Authorization", "Bearer $authToken")
+                .GET()
+                .build()
+            val res = http.send(req, HttpResponse.BodyHandlers.ofString())
+            if (res.statusCode() == 200) {
+                val arr = JsonParser.parseString(res.body()).asJsonArray
+                // Try match by id field if present
+                for (el in arr) {
+                    val obj = el.asJsonObject
+                    val id = obj.get("id")?.asLong
+                    if (id != null && id == snapshotId) {
+                        return obj.get("object_name")?.asString
+                            ?: obj.get("objectName")?.asString
+                    }
+                }
+                // Fallback: take the most recent archive (flag=A, not pre-recovery)
+                for (el in arr) {
+                    val obj = el.asJsonObject
+                    val flag = obj.get("flag")?.asString ?: ""
+                    val pathId = obj.get("pathId")?.asString ?: obj.get("path_id")?.asString ?: ""
+                    if (flag == "A" && pathId != "PRE_REC") {
+                        val name = obj.get("objectName")?.asString ?: obj.get("object_name")?.asString
+                        if (name != null) {
+                            println("[restore] Using archive snapshot: pathId=$pathId, object=$name")
+                            return name
+                        }
+                    }
+                }
+            }
+        } catch (e: Exception) {
+            System.err.println("[restore] Snapshot lookup failed: ${e.message}")
+        }
+        return null
+    }
+
+    private fun downloadByObjectListing(authToken: String): ByteArray? {
+        try {
             val infoReq = HttpRequest.newBuilder()
                 .uri(URI.create("$bufferUrl/objects"))
                 .timeout(Duration.ofSeconds(30))
+                .header("Authorization", "Bearer $authToken")
                 .GET()
                 .build()
             val infoRes = http.send(infoReq, HttpResponse.BodyHandlers.ofString())
@@ -576,13 +689,15 @@ class RestoreOrchestrator(
             val downloadReq = HttpRequest.newBuilder()
                 .uri(URI.create("$bufferUrl/objects/$objectName"))
                 .timeout(Duration.ofMinutes(10))
+                .header("Authorization", "Bearer $authToken")
                 .GET()
                 .build()
             val downloadRes = http.send(downloadReq, HttpResponse.BodyHandlers.ofByteArray())
-            if (downloadRes.statusCode() == 200) downloadRes.body() else null
+            if (downloadRes.statusCode() == 200) return downloadRes.body()
+            return null
         } catch (e: Exception) {
-            System.err.println("[restore] Object name download failed: ${e.message}")
-            null
+            System.err.println("[restore] Object listing download failed: ${e.message}")
+            return null
         }
     }
 

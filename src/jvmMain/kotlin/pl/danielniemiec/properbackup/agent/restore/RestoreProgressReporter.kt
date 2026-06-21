@@ -66,6 +66,25 @@ class RestoreProgressReporter(
         lastReportTime = System.currentTimeMillis()
     }
 
+    fun reportStarted() {
+        try {
+            val body = gson.toJson(mapOf("event" to "agent_started"))
+            val req = HttpRequest.newBuilder()
+                .uri(URI.create("$bufferUrl/agent/recovery/$sessionId/started"))
+                .timeout(Duration.ofSeconds(15))
+                .header("Authorization", "Bearer $token")
+                .header("Content-Type", "application/json")
+                .POST(HttpRequest.BodyPublishers.ofString(body))
+                .build()
+            val res = http.send(req, HttpResponse.BodyHandlers.ofString())
+            if (res.statusCode() != 200) {
+                System.err.println("[restore] start report returned ${res.statusCode()}: ${res.body()}")
+            }
+        } catch (e: Exception) {
+            System.err.println("[restore] start report failed: ${e.message}")
+        }
+    }
+
     fun reportComplete(success: Boolean, verification: String = "OK") {
         flush()
         try {
