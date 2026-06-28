@@ -87,7 +87,12 @@ class RestoreOrchestrator(
         val reporter = RestoreProgressReporter(bufferUrl, cmd.sessionId, token)
         val guard = CriticalPathsGuard(configDir, stateDir, backupRoots)
 
+        // Prefer the dedicated buffer manifest endpoint; when it is unavailable
+        // (e.g. buffer does not expose /agent/snapshot/{id}/files), derive the
+        // file list from the encrypted archive pack — same source of truth the
+        // actual restore uses, so dry-run and execute always agree.
         val snapshotFiles = fetchSnapshotFiles(cmd.targetSnapshotId)
+            ?: deriveSnapshotFilesFromArchive(cmd.targetSnapshotId)
         if (snapshotFiles == null) {
             reporter.reportComplete(false, "Cannot fetch snapshot manifest")
             return
@@ -567,6 +572,40 @@ class RestoreOrchestrator(
         }
         // Fallback: return null — caller will derive file list from archive contents
         return null
+    }
+
+    /**
+     * Derive the snapshot file list (path + sha256 + size) by downloading the
+     * encrypted archive pack, decrypting it and extracting the tar.gz. Mirrors
+     * the fallback used by [executeRestore] so the dry-run plan is computed from
+     * the exact same data that the restore writes back.
+     */
+    private fun deriveSnapshotFilesFromArchive(snapshotId: Long): List<SnapshotFile>? {
+        val archiveData = downloadArchivePack(snapshotId)
+        if (archiveData == null) {
+            println("[restore] deriveSnapshotFilesFromArchive: cannot download archive pack")
+            return null
+        }
+        val decrypted = try {
+            extractTarGz(decrypt(archiveData))
+        } catch (e: Exception) {
+            println("[restore] deriveSnapshotFilesFromArchive: decrypt/extract failed: ${e.message}")
+            return null
+        }
+        if (decrypted.isEmpty()) return null
+        println("[restore] Deriving file list from archive contents (${decrypted.size} files)")
+        return decrypted.map { (entryName, data) ->
+            val restorePath = if (backupRoots.isNotEmpty()) {
+                Path.of(backupRoots[0]).resolve(entryName).toAbsolutePath().normalize().toString()
+            } else {
+                entryName
+            }
+            SnapshotFile(
+                path = restorePath,
+                sha256 = sha256(data),
+                sizeBytes = data.size.toLong(),
+            )
+        }
     }
 
     private fun downloadArchivePack(snapshotId: Long): ByteArray? {
