@@ -14,5 +14,6 @@ class GlobalConfig {
         var server_id: String = ""
         var poll_interval_seconds: Int = 300
         var panel_url: String = ""
+        var jwt_token: String = ""
     }
 }
